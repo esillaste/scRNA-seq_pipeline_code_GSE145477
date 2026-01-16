@@ -1,0 +1,454 @@
+# ============================================================
+# GSE145477 (bone marrow mesenchymal lineage / MALP paper) – Seurat v5 pipeline
+# Windows-safe, self-contained matrix .txt.gz (gene column + barcode header)
+#
+# GOAL:
+#   - Integrate ages (1M, 1.5M, 3M, 16M)
+#   - Cluster + UMAP
+#   - Canonical marker scoring to annotate major marrow/bone lineages
+#   - Klb expression: FeaturePlot/VlnPlot/DotPlot + summary tables
+#
+# INPUT files like:
+#   GSM4318799_1M_matrix.txt.gz
+# containing:
+#   - header row = cell barcodes
+#   - first column = gene names
+#   - remaining columns = raw counts
+#
+# OUTPUT:
+#   outputs_seurat/qc, figs, tables, objs
+#
+# NOTE ON kNN before UMAP:
+#   - kNN/SNN (FindNeighbors) is REQUIRED for clustering.
+#   - UMAP can run without FindNeighbors, but in Seurat we typically run
+#     FindNeighbors + FindClusters first (recommended; also you want clusters anyway).
+# ============================================================
+
+options(stringsAsFactors = FALSE)
+set.seed(42)
+
+# ---------------- Packages ----------------
+pkgs <- c("Seurat", "SeuratObject", "Matrix", "dplyr", "ggplot2", "patchwork", "data.table", "future")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("glmGamPoi", quietly = TRUE)) BiocManager::install("glmGamPoi", ask = FALSE, update = FALSE)
+
+options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
+future::plan("sequential")
+
+# ---------------- Paths ----------------
+data_dir <- "C:/Users/esillaste/Downloads/GSE145477_RAW"
+out_dir  <- file.path(data_dir, "outputs_seurat")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_dir, "qc"), showWarnings = FALSE)
+dir.create(file.path(out_dir, "objs"), showWarnings = FALSE)
+dir.create(file.path(out_dir, "figs"), showWarnings = FALSE)
+dir.create(file.path(out_dir, "tables"), showWarnings = FALSE)
+
+dataset <- "GSE145477"
+
+# ============================================================
+# 1) Locate matrix files + infer age
+# ============================================================
+mat_files <- list.files(data_dir, pattern = "_matrix\\.txt\\.gz$", full.names = TRUE, ignore.case = TRUE)
+if (length(mat_files) == 0) stop("No *_matrix.txt.gz files found in: ", data_dir)
+
+infer_age <- function(path) {
+  nm <- tolower(basename(path))
+  if (grepl("16m", nm)) return("16M")
+  if (grepl("1\\.5m", nm) || grepl("1_5m", nm)) return("1.5M")
+  if (grepl("3m", nm) && !grepl("16m", nm)) return("3M")
+  if (grepl("1m", nm) && !grepl("1\\.5m", nm) && !grepl("1_5m", nm) && !grepl("16m", nm)) return("1M")
+  NA_character_
+}
+
+manifest <- data.frame(matrix = mat_files, age = sapply(mat_files, infer_age), stringsAsFactors = FALSE)
+if (any(is.na(manifest$age))) {
+  stop("Could not infer age for:\n", paste(basename(manifest$matrix[is.na(manifest$age)]), collapse = "\n"))
+}
+manifest <- manifest %>% dplyr::arrange(factor(age, levels = c("1M","1.5M","3M","16M")))
+message("Found matrix files:\n", paste(basename(manifest$matrix), collapse = "\n"))
+
+# ============================================================
+# 2) Read self-contained matrix (gene col + barcode header)
+# ============================================================
+read_counts_selfcontained <- function(mat_path) {
+  df <- data.table::fread(mat_path, header = TRUE, data.table = FALSE, check.names = FALSE)
+  if (ncol(df) < 2) stop("Unexpected format for: ", basename(mat_path))
+
+  gene_names <- as.character(df[[1]])
+  mat_df <- df[, -1, drop = FALSE]
+
+  mat_num <- as.matrix(sapply(mat_df, function(x) as.numeric(x)))
+  rownames(mat_num) <- make.unique(gene_names)
+  colnames(mat_num) <- colnames(mat_df)
+
+  Matrix::Matrix(mat_num, sparse = TRUE)
+}
+
+# ============================================================
+# 3) QC + SCTransform per sample
+# ============================================================
+compute_qc_thresholds <- function(obj,
+                                 mito_max = 20,
+                                 min_features = 200,
+                                 min_counts = 500,
+                                 max_features_quantile = 0.99,
+                                 max_counts_quantile = 0.99) {
+  md <- obj@meta.data
+  list(
+    min_features = min_features,
+    min_counts   = min_counts,
+    mito_max     = mito_max,
+    max_features = as.numeric(quantile(md$nFeature_RNA, probs = max_features_quantile, na.rm = TRUE)),
+    max_counts   = as.numeric(quantile(md$nCount_RNA,   probs = max_counts_quantile,   na.rm = TRUE))
+  )
+}
+
+apply_qc <- function(obj, thr) {
+  subset(
+    obj,
+    subset =
+      nFeature_RNA >= thr$min_features &
+      nCount_RNA   >= thr$min_counts &
+      percent.mt   <= thr$mito_max &
+      nFeature_RNA <= thr$max_features &
+      nCount_RNA   <= thr$max_counts
+  )
+}
+
+preprocess_sample <- function(counts, sample_id, age,
+                              mito_pattern = "^mt-",
+                              vars_to_regress = c("percent.mt")) {
+
+  obj <- CreateSeuratObject(counts = counts, project = sample_id, min.cells = 3, min.features = 200)
+  obj <- RenameCells(obj, add.cell.id = sample_id)  # globally unique barcodes
+
+  obj$sample_id <- sample_id
+  obj$age_group <- age
+
+  obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = mito_pattern)
+  obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^Rpl|^Rps")
+
+  thr <- compute_qc_thresholds(obj)
+  obj <- apply_qc(obj, thr)
+
+  obj <- SCTransform(
+    obj,
+    assay = "RNA",
+    vars.to.regress = vars_to_regress,
+    method = "glmGamPoi",
+    verbose = FALSE
+  )
+
+  obj
+}
+
+obj_list <- list()
+
+for (i in seq_len(nrow(manifest))) {
+  age <- manifest$age[i]
+  mat_path <- manifest$matrix[i]
+  sample_id <- paste0(dataset, "_", age)
+
+  message("\nLoading + preprocessing ", sample_id, " ...")
+  counts <- read_counts_selfcontained(mat_path)
+  obj <- preprocess_sample(counts, sample_id = sample_id, age = age)
+
+  p_qc <- VlnPlot(obj, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3, pt.size = 0.1) +
+    patchwork::plot_annotation(title = sample_id)
+  ggsave(file.path(out_dir, "qc", paste0("QC_vln_", sample_id, ".png")), p_qc, width = 12, height = 4, dpi = 300)
+
+  obj_list[[sample_id]] <- obj
+}
+if (length(obj_list) < 2) stop("Need at least 2 samples to integrate; found: ", length(obj_list))
+
+# ============================================================
+# 4) SCT anchor-based RPCA integration
+# ============================================================
+dims_use <- 1:30
+nfeatures_use <- 3000
+resolution_use <- 0.4
+
+features <- SelectIntegrationFeatures(object.list = obj_list, nfeatures = nfeatures_use)
+obj_list <- PrepSCTIntegration(object.list = obj_list, anchor.features = features, verbose = FALSE)
+
+# RPCA requires PCA per object
+obj_list <- lapply(obj_list, function(x) RunPCA(x, features = features, npcs = max(dims_use), verbose = FALSE))
+
+anchors <- FindIntegrationAnchors(
+  object.list = obj_list,
+  normalization.method = "SCT",
+  anchor.features = features,
+  reduction = "rpca",
+  dims = dims_use
+)
+
+obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT", dims = dims_use)
+
+# ============================================================
+# 5) PCA -> neighbors -> clusters -> UMAP
+# ============================================================
+DefaultAssay(obj) <- "integrated"
+obj <- RunPCA(obj, npcs = max(dims_use), verbose = FALSE)
+
+# kNN/SNN is REQUIRED for clustering; recommended before UMAP
+obj <- FindNeighbors(obj, reduction = "pca", dims = dims_use, verbose = FALSE)
+obj <- FindClusters(obj, resolution = resolution_use, verbose = FALSE)
+obj <- RunUMAP(obj, reduction = "pca", dims = dims_use, verbose = FALSE)
+
+saveRDS(obj, file.path(out_dir, "objs", "GSE145477_integrated_seurat.rds"))
+
+# UMAPs
+p_umap_clusters <- DimPlot(obj, reduction = "umap", group.by = "seurat_clusters", label = TRUE) + NoLegend()
+ggsave(file.path(out_dir, "figs", "UMAP_clusters.png"), p_umap_clusters, width = 7, height = 6, dpi = 300)
+
+p_umap_age <- DimPlot(obj, reduction = "umap", group.by = "age_group")
+ggsave(file.path(out_dir, "figs", "UMAP_age_group.png"), p_umap_age, width = 7, height = 6, dpi = 300)
+
+p_umap_age_split <- DimPlot(obj, reduction = "umap", split.by = "age_group")
+ggsave(file.path(out_dir, "figs", "UMAP_split_by_age_group.png"), p_umap_age_split, width = 12, height = 6, dpi = 300)
+
+# ============================================================
+# 6) Markers per cluster (SCT) – helpful to validate annotation
+# ============================================================
+Idents(obj) <- "seurat_clusters"
+DefaultAssay(obj) <- "SCT"
+obj <- PrepSCTFindMarkers(obj)
+
+markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+data.table::fwrite(markers, file.path(out_dir, "tables", "cluster_markers_FindAllMarkers.csv"))
+
+# ============================================================
+# 7) Canonical cell-type scoring + auto annotation
+#
+# We cover (major expected marrow/bone-associated types):
+#   - Mesenchymal/SSPC/MSC-like stromal (Lepr/Cxcl12/Pdgfra/Ly6a)
+#   - Osteoprogenitor / osteoblast lineage
+#   - Osteocyte (often rare/absent in marrow preps, but included to confirm)
+#   - Adipogenic + MALP-like (Adipoq/Lpl/Fabp4 + niche genes)
+#   - Pericyte/mural + smooth muscle
+#   - Endothelial
+#   - Osteoclast (myeloid lineage; if present in dataset)
+#   - Myeloid / monocyte-macrophage, neutrophil, dendritic
+#   - B cell, T/NK cell, plasma cell
+#   - HSPC/progenitors
+#   - Erythroid
+#   - Megakaryocyte
+# ============================================================
+
+# Score using RNA log-normalized data
+DefaultAssay(obj) <- "RNA"
+obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE)
+
+gene_sets_raw <- list(
+  # --- Mesenchymal / stromal
+  MSC_SSPC      = c("Pdgfra","Ly6a","Lepr","Cxcl12","Kitl"),
+
+  # --- Osteolineage
+  Osteoprogenitor = c("Sp7","Runx2","Alpl","Col1a1","Col1a2"),
+  Osteoblast      = c("Bglap","Ibsp","Spp1","Alpl","Col1a1","Col1a2"),
+  Osteocyte       = c("Dmp1","Phex","Sost","Mepe","Fgf23","Ptprz1"),
+
+  # --- Adipo lineage + MALP (Adipoq+ stromal niche)
+  Adipogenic    = c("Pparg","Cebpa","Lpl","Fabp4","Adipoq"),
+  MALP          = c("Adipoq","Lpl","Fabp4","Pparg","Cxcl12","Lepr","Kitl","Apoe"),
+
+  # --- Vascular / mural
+  Pericyte      = c("Rgs5","Pdgfrb","Cspg4","Mcam","Des","Acta2"),
+  SmoothMuscle  = c("Acta2","Tagln","Myh11","Cnn1"),
+  Endothelial   = c("Pecam1","Kdr","Vwf","Emcn","Kdr","Robo4"),
+
+  # --- Osteoclast / resorbing macrophage lineage
+  Osteoclast    = c("Acp5","Ctsk","Mmp9","Atp6v0d2","Ocstamp","Tcirg1","Calcr","Spi1"),
+
+  # --- Myeloid / innate immune
+  Myeloid       = c("Lyz2","Tyrobp","Fcgr3","Lgals3","S100a8","S100a9"),
+  Macrophage    = c("Adgre1","Csf1r","Lgals3","Mertk","Marco"),
+  Neutrophil    = c("S100a8","S100a9","Ly6g","Mpo","Elane"),
+  Dendritic     = c("Itgax","Flt3","Clec10a","Xcr1","Irf8"),
+
+  # --- Lymphoid
+  Bcell         = c("Ms4a1","Cd79a","Cd79b","Cd74","H2-Ab1"),
+  Plasma        = c("Jchain","Mzb1","Xbp1","Sdc1"),
+  Tcell_NK      = c("Cd3d","Cd3e","Trac","Ltb","Nkg7","Gzmb"),
+
+  # --- HSPC / cycling progenitors
+  HSPC          = c("Kit","Lmo2","Gata2","Procr","Ly6a"),
+  Cycling       = c("Mki67","Top2a","Tubb5","Pclaf","Cenpf"),
+
+  # --- Erythroid / megakaryocyte
+  Erythroid     = c("Hbb-bs","Hbb-bt","Hba-a1","Hba-a2","Alas2"),
+  Megakaryocyte = c("Ppbp","Pf4","Nrgp","Itga2b")
+)
+
+# Filter to genes present
+genes_present <- rownames(obj[["RNA"]])
+gene_sets <- lapply(gene_sets_raw, function(gs) unique(gs[gs %in% genes_present]))
+gene_sets <- gene_sets[sapply(gene_sets, length) >= 2]  # keep only usable sets
+
+if (length(gene_sets) == 0) stop("All gene sets empty after filtering to present genes. Check feature naming.")
+
+cat("\nGene sets retained for scoring (counts):\n")
+print(sapply(gene_sets, length))
+
+# AddModuleScore per gene set (robust: ensures all score columns exist)
+score_cols <- character(0)
+for (nm in names(gene_sets)) {
+  prefix <- paste0(nm, "_Score")
+  obj <- AddModuleScore(obj, features = list(gene_sets[[nm]]), name = prefix, assay = "RNA", search = FALSE)
+  colnm <- paste0(prefix, "1")
+  if (colnm %in% colnames(obj@meta.data)) score_cols <- c(score_cols, colnm)
+}
+
+cat("\nScore columns created:\n")
+print(score_cols)
+if (length(score_cols) < 2) warning("Only ", length(score_cols), " score column(s) created. Annotation will be limited.")
+
+# Cluster-average scores
+scores_df <- FetchData(obj, vars = c("seurat_clusters", score_cols))
+cluster_scores <- scores_df %>%
+  dplyr::group_by(seurat_clusters) %>%
+  dplyr::summarise(dplyr::across(dplyr::all_of(score_cols), mean), .groups = "drop")
+
+score_mat <- as.matrix(cluster_scores[, score_cols, drop = FALSE])
+
+# Winner = max scoring program per cluster
+winner_col <- apply(score_mat, 1, function(x) colnames(score_mat)[which.max(x)])
+winner_set <- gsub("_Score1$", "", winner_col)
+
+# Map to cleaner names
+pretty_map <- c(
+  MSC_SSPC="MSC/SSPC",
+  Osteoprogenitor="Osteoprogenitor",
+  Osteoblast="Osteoblast",
+  Osteocyte="Osteocyte",
+  Adipogenic="Adipogenic",
+  MALP="MALP",
+  Pericyte="Pericyte/Mural",
+  SmoothMuscle="Smooth muscle",
+  Endothelial="Endothelial",
+  Osteoclast="Osteoclast",
+  Myeloid="Myeloid",
+  Macrophage="Macrophage",
+  Neutrophil="Neutrophil",
+  Dendritic="Dendritic",
+  Bcell="B cell",
+  Plasma="Plasma cell",
+  Tcell_NK="T/NK cell",
+  HSPC="HSPC",
+  Cycling="Cycling",
+  Erythroid="Erythroid",
+  Megakaryocyte="Megakaryocyte"
+)
+
+cluster_scores$auto_label <- winner_set
+cluster_scores$celltype <- unname(pretty_map[cluster_scores$auto_label])
+
+# If any NA labels occur (e.g., a set name not in pretty_map), keep raw label
+cluster_scores$celltype[is.na(cluster_scores$celltype)] <- cluster_scores$auto_label[is.na(cluster_scores$celltype)]
+
+# Apply cluster labels to cells
+label_map <- setNames(cluster_scores$celltype, cluster_scores$seurat_clusters)
+obj$celltype <- unname(label_map[as.character(obj$seurat_clusters)])
+
+# Save annotation table
+data.table::fwrite(cluster_scores, file.path(out_dir, "tables", "cluster_auto_annotation_by_module_score.csv"))
+
+# Annotated UMAP
+p_umap_celltype <- DimPlot(obj, reduction = "umap", group.by = "celltype", label = TRUE, repel = TRUE) + NoLegend()
+ggsave(file.path(out_dir, "figs", "UMAP_celltype_auto.png"), p_umap_celltype, width = 9, height = 7, dpi = 300)
+
+# Validate with DotPlot of canonical markers
+canon_plot_genes <- unique(unlist(gene_sets))
+p_dot_canon <- DotPlot(obj, features = canon_plot_genes, group.by = "seurat_clusters") + RotatedAxis()
+ggsave(file.path(out_dir, "figs", "DotPlot_canonical_markers_by_cluster.png"), p_dot_canon, width = 16, height = 7, dpi = 300)
+
+# ============================================================
+# 8) Klb plots + summaries (RNA)
+# ============================================================
+DefaultAssay(obj) <- "RNA"
+gene <- "Klb"
+if (!(gene %in% rownames(obj[["RNA"]]))) stop("Gene ", gene, " not found in RNA features. Check symbol (mouse: Klb).")
+
+# Feature plots
+p_klb <- FeaturePlot(obj, features = gene, reduction = "umap", order = TRUE)
+ggsave(file.path(out_dir, "figs", paste0("UMAP_Feature_", gene, "_RNAdata.png")),
+       p_klb, width = 7, height = 6, dpi = 300)
+
+p_klb_split <- FeaturePlot(obj, features = gene, reduction = "umap", split.by = "age_group", order = TRUE)
+ggsave(file.path(out_dir, "figs", paste0("UMAP_Feature_", gene, "_splitBy_age_group.png")),
+       p_klb_split, width = 12, height = 6, dpi = 300)
+
+# Violin/Dot by cluster
+p_vln_cl <- VlnPlot(obj, features = gene, group.by = "seurat_clusters", pt.size = 0.1)
+ggsave(file.path(out_dir, "figs", paste0("Violin_", gene, "_by_clusters.png")),
+       p_vln_cl, width = 10, height = 5, dpi = 300)
+
+p_dot_cl <- DotPlot(obj, features = gene, group.by = "seurat_clusters") + RotatedAxis()
+ggsave(file.path(out_dir, "figs", paste0("DotPlot_", gene, "_by_clusters.png")),
+       p_dot_cl, width = 10, height = 4, dpi = 300)
+
+# Violin/Dot by celltype
+p_vln_ct <- VlnPlot(obj, features = gene, group.by = "celltype", pt.size = 0.1)
+ggsave(file.path(out_dir, "figs", paste0("Violin_", gene, "_by_celltype.png")),
+       p_vln_ct, width = 12, height = 5, dpi = 300)
+
+p_dot_ct <- DotPlot(obj, features = gene, group.by = "celltype") + RotatedAxis()
+ggsave(file.path(out_dir, "figs", paste0("DotPlot_", gene, "_by_celltype.png")),
+       p_dot_ct, width = 10, height = 4, dpi = 300)
+
+# Summaries by celltype (+ by age)
+df_ct <- FetchData(obj, vars = c(gene, "celltype", "age_group"))
+colnames(df_ct)[1] <- "expr"
+df_ct$expressing <- df_ct$expr > 0
+
+tab_celltype <- df_ct %>%
+  dplyr::group_by(celltype) %>%
+  dplyr::summarise(
+    n_cells = n(),
+    pct_expressing = mean(expressing) * 100,
+    mean_expr = mean(expr),
+    median_expr = median(expr),
+    .groups = "drop"
+  ) %>% dplyr::arrange(dplyr::desc(pct_expressing), dplyr::desc(mean_expr))
+data.table::fwrite(tab_celltype, file.path(out_dir, "tables", paste0(gene, "_summary_by_celltype.csv")))
+
+tab_celltype_age <- df_ct %>%
+  dplyr::group_by(celltype, age_group) %>%
+  dplyr::summarise(
+    n_cells = n(),
+    pct_expressing = mean(expressing) * 100,
+    mean_expr = mean(expr),
+    median_expr = median(expr),
+    .groups = "drop"
+  ) %>% dplyr::arrange(dplyr::desc(pct_expressing), dplyr::desc(mean_expr))
+data.table::fwrite(tab_celltype_age, file.path(out_dir, "tables", paste0(gene, "_summary_by_celltype_and_age.csv")))
+
+# Extra: sparsity-friendly % expressing (Klb is extremely sparse in your run)
+df_bin <- FetchData(obj, vars = c(gene, "celltype"))
+colnames(df_bin)[1] <- "expr"
+df_bin$expressing <- df_bin$expr > 0
+
+pct_by_celltype <- df_bin %>%
+  dplyr::group_by(celltype) %>%
+  dplyr::summarise(pct_expressing = mean(expressing) * 100, n_cells = n(), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(pct_expressing))
+data.table::fwrite(pct_by_celltype, file.path(out_dir, "tables", paste0(gene, "_pct_expressing_by_celltype.csv")))
+
+p_bar_ct <- ggplot2::ggplot(pct_by_celltype, ggplot2::aes(x = reorder(celltype, pct_expressing), y = pct_expressing)) +
+  ggplot2::geom_col() +
+  ggplot2::coord_flip() +
+  ggplot2::labs(x = "Cell type", y = paste0("% cells with ", gene, " > 0"), title = paste0(gene, " % expressing by cell type")) +
+  ggplot2::theme_bw()
+ggsave(file.path(out_dir, "figs", paste0(gene, "_PctExpressing_by_celltype_bar.png")),
+       p_bar_ct, width = 8, height = 6, dpi = 300)
+
+# Save final object
+saveRDS(obj, file.path(out_dir, "objs", "GSE145477_integrated_seurat_FINAL_annotated.rds"))
+
+message("\nDONE. Outputs in: ", out_dir)
+sessionInfo()
