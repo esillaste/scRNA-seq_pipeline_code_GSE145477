@@ -5,23 +5,16 @@
 # GOAL:
 #   - Integrate ages (1M, 1.5M, 3M, 16M)
 #   - Cluster + UMAP
-#   - Canonical marker scoring to annotate major marrow/bone lineages
-#   - Klb expression: FeaturePlot/VlnPlot/DotPlot + summary tables
-#
-# INPUT files like:
-#   GSM4318799_1M_matrix.txt.gz
-# containing:
-#   - header row = cell barcodes
-#   - first column = gene names
-#   - remaining columns = raw counts
-#
-# OUTPUT:
-#   outputs_seurat/qc, figs, tables, objs
+#   - IMPROVED annotation:
+#       (A) Broad compartment call (Mesenchymal vs Endothelial vs Mural vs Hematopoietic)
+#       (B) Refined subtype call within each compartment
+#   - Klb expression plots + summary tables
 #
 # NOTE ON kNN before UMAP:
-#   - kNN/SNN (FindNeighbors) is REQUIRED for clustering.
-#   - UMAP can run without FindNeighbors, but in Seurat we typically run
-#     FindNeighbors + FindClusters first (recommended; also you want clusters anyway).
+#   - FindNeighbors is REQUIRED for graph clustering (FindClusters).
+#   - UMAP itself can run without FindNeighbors, but in Seurat we typically do:
+#       PCA -> FindNeighbors -> FindClusters -> RunUMAP
+#     so UMAP and clusters reflect the same neighborhood structure.
 # ============================================================
 
 options(stringsAsFactors = FALSE)
@@ -158,9 +151,11 @@ for (i in seq_len(nrow(manifest))) {
   counts <- read_counts_selfcontained(mat_path)
   obj <- preprocess_sample(counts, sample_id = sample_id, age = age)
 
-  p_qc <- VlnPlot(obj, features = c("nFeature_RNA","nCount_RNA","percent.mt"), ncol = 3, pt.size = 0.1) +
+  p_qc <- VlnPlot(obj, features = c("nFeature_RNA","nCount_RNA","percent.mt"),
+                  ncol = 3, pt.size = 0.1) +
     patchwork::plot_annotation(title = sample_id)
-  ggsave(file.path(out_dir, "qc", paste0("QC_vln_", sample_id, ".png")), p_qc, width = 12, height = 4, dpi = 300)
+  ggsave(file.path(out_dir, "qc", paste0("QC_vln_", sample_id, ".png")),
+         p_qc, width = 12, height = 4, dpi = 300)
 
   obj_list[[sample_id]] <- obj
 }
@@ -195,7 +190,6 @@ obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT", dims = d
 DefaultAssay(obj) <- "integrated"
 obj <- RunPCA(obj, npcs = max(dims_use), verbose = FALSE)
 
-# kNN/SNN is REQUIRED for clustering; recommended before UMAP
 obj <- FindNeighbors(obj, reduction = "pca", dims = dims_use, verbose = FALSE)
 obj <- FindClusters(obj, resolution = resolution_use, verbose = FALSE)
 obj <- RunUMAP(obj, reduction = "pca", dims = dims_use, verbose = FALSE)
@@ -213,159 +207,234 @@ p_umap_age_split <- DimPlot(obj, reduction = "umap", split.by = "age_group")
 ggsave(file.path(out_dir, "figs", "UMAP_split_by_age_group.png"), p_umap_age_split, width = 12, height = 6, dpi = 300)
 
 # ============================================================
-# 6) Markers per cluster (SCT) – helpful to validate annotation
+# 6) Markers per cluster (SCT) – validate annotation
 # ============================================================
 Idents(obj) <- "seurat_clusters"
 DefaultAssay(obj) <- "SCT"
 obj <- PrepSCTFindMarkers(obj)
-
 markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
 data.table::fwrite(markers, file.path(out_dir, "tables", "cluster_markers_FindAllMarkers.csv"))
 
 # ============================================================
-# 7) Canonical cell-type scoring + auto annotation
+# 7) IMPROVED ANNOTATION (two-stage, robust)
+#   Stage A: broad compartment (Mesenchymal / Endothelial / Mural / Hematopoietic / Erythroid / Mega / Cycling / Other)
+#   Stage B: subtype within compartment
 #
-# We cover (major expected marrow/bone-associated types):
-#   - Mesenchymal/SSPC/MSC-like stromal (Lepr/Cxcl12/Pdgfra/Ly6a)
-#   - Osteoprogenitor / osteoblast lineage
-#   - Osteocyte (often rare/absent in marrow preps, but included to confirm)
-#   - Adipogenic + MALP-like (Adipoq/Lpl/Fabp4 + niche genes)
-#   - Pericyte/mural + smooth muscle
-#   - Endothelial
-#   - Osteoclast (myeloid lineage; if present in dataset)
-#   - Myeloid / monocyte-macrophage, neutrophil, dendritic
-#   - B cell, T/NK cell, plasma cell
-#   - HSPC/progenitors
-#   - Erythroid
-#   - Megakaryocyte
+# Important: osteoclasts are NOT mesenchymal-lineage, but can appear as contaminant/other fraction.
+# We explicitly allow them as a hematopoietic subtype (myeloid-derived).
 # ============================================================
 
-# Score using RNA log-normalized data
 DefaultAssay(obj) <- "RNA"
 obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE)
+genes_present <- rownames(obj[["RNA"]])
 
-gene_sets_raw <- list(
-  # --- Mesenchymal / stromal
-  MSC_SSPC      = c("Pdgfra","Ly6a","Lepr","Cxcl12","Kitl"),
+# ---------- helpers ----------
+filter_sets <- function(gs_list, genes_present, min_genes = 2) {
+  gs <- lapply(gs_list, function(v) unique(v[v %in% genes_present]))
+  gs[sapply(gs, length) >= min_genes]
+}
 
-  # --- Osteolineage
+add_scores_per_set <- function(obj, gs_list, assay = "RNA") {
+  score_cols <- character(0)
+  for (nm in names(gs_list)) {
+    prefix <- paste0(nm, "_Score")
+    obj <- AddModuleScore(obj, features = list(gs_list[[nm]]), name = prefix, assay = assay, search = FALSE)
+    colnm <- paste0(prefix, "1")
+    if (colnm %in% colnames(obj@meta.data)) score_cols <- c(score_cols, colnm)
+  }
+  list(obj = obj, score_cols = score_cols)
+}
+
+cluster_mean_scores <- function(obj, score_cols) {
+  df <- FetchData(obj, vars = c("seurat_clusters", score_cols))
+  df %>%
+    dplyr::group_by(seurat_clusters) %>%
+    dplyr::summarise(dplyr::across(dplyr::all_of(score_cols), mean), .groups = "drop")
+}
+
+winner_label <- function(cluster_scores, score_cols) {
+  mat <- as.matrix(cluster_scores[, score_cols, drop = FALSE])
+  wcol <- apply(mat, 1, function(x) colnames(mat)[which.max(x)])
+  gsub("_Score1$", "", wcol)
+}
+
+# ---------- Stage A: BROAD compartments ----------
+broad_sets_raw <- list(
+  # Hematopoietic pan-immune (CD45-ish + innate signaling)
+  Hematopoietic = c("Ptprc","Lyz2","Tyrobp","Aif1","Spi1","LST1"),
+  # Erythroid
+  Erythroid      = c("Hbb-bs","Hbb-bt","Hba-a1","Hba-a2","Alas2","Gypa"),
+  # Megakaryocyte/platelet
+  Megakaryocyte  = c("Pf4","Ppbp","Nrgp","Itga2b"),
+  # Endothelium
+  Endothelial    = c("Pecam1","Kdr","Vwf","Emcn","Robo4"),
+  # Mural / pericyte / SMC
+  Mural          = c("Rgs5","Pdgfrb","Cspg4","Mcam","Des","Acta2","Tagln","Myh11"),
+  # Mesenchymal/stromal (Lepr/Cxcl12 axis + Pdgfra/Ly6a)
+  Mesenchymal    = c("Lepr","Cxcl12","Kitl","Pdgfra","Ly6a","Col1a1","Col1a2"),
+  # Cycling (to prevent cycling clusters from being mislabeled as “something else”)
+  Cycling        = c("Mki67","Top2a","Cenpf","Pclaf","Tubb5")
+)
+
+broad_sets <- filter_sets(broad_sets_raw, genes_present, min_genes = 2)
+if (length(broad_sets) == 0) stop("Broad annotation gene sets all empty after filtering. Check gene symbols/features.")
+
+cat("\n[Annotation] Broad sets retained:\n")
+print(sapply(broad_sets, length))
+
+tmp <- add_scores_per_set(obj, broad_sets, assay = "RNA")
+obj <- tmp$obj
+broad_score_cols <- tmp$score_cols
+
+broad_cluster_scores <- cluster_mean_scores(obj, broad_score_cols)
+broad_cluster_scores$broad_label <- winner_label(broad_cluster_scores, broad_score_cols)
+
+# human-friendly mapping
+broad_pretty <- c(
+  Hematopoietic="Hematopoietic",
+  Erythroid="Erythroid",
+  Megakaryocyte="Megakaryocyte",
+  Endothelial="Endothelial",
+  Mural="Mural/Pericyte/SMC",
+  Mesenchymal="Mesenchymal/Stromal",
+  Cycling="Cycling"
+)
+broad_cluster_scores$broad_class <- unname(broad_pretty[broad_cluster_scores$broad_label])
+broad_cluster_scores$broad_class[is.na(broad_cluster_scores$broad_class)] <- broad_cluster_scores$broad_label[is.na(broad_cluster_scores$broad_class)]
+
+# apply to cells
+broad_map <- setNames(broad_cluster_scores$broad_class, broad_cluster_scores$seurat_clusters)
+obj$broad_class <- unname(broad_map[as.character(obj$seurat_clusters)])
+
+data.table::fwrite(broad_cluster_scores,
+                   file.path(out_dir, "tables", "cluster_broad_annotation_by_module_score.csv"))
+
+p_umap_broad <- DimPlot(obj, reduction = "umap", group.by = "broad_class", label = TRUE, repel = TRUE) + NoLegend()
+ggsave(file.path(out_dir, "figs", "UMAP_broad_class.png"), p_umap_broad, width = 9, height = 7, dpi = 300)
+
+# ---------- Stage B: SUBTYPES within each broad compartment ----------
+# Define subtype sets (kept reasonably canonical + expected in marrow preps)
+subtype_sets_raw <- list(
+  # Mesenchymal / stromal subtypes
+  SSPC_MSC        = c("Lepr","Cxcl12","Kitl","Pdgfra","Ly6a","Alcam","Vcam1"),
   Osteoprogenitor = c("Sp7","Runx2","Alpl","Col1a1","Col1a2"),
   Osteoblast      = c("Bglap","Ibsp","Spp1","Alpl","Col1a1","Col1a2"),
   Osteocyte       = c("Dmp1","Phex","Sost","Mepe","Fgf23","Ptprz1"),
+  Adipogenic      = c("Pparg","Cebpa","Lpl","Fabp4","Adipoq"),
+  MALP            = c("Adipoq","Lpl","Fabp4","Pparg","Cxcl12","Lepr","Kitl","Apoe"),
 
-  # --- Adipo lineage + MALP (Adipoq+ stromal niche)
-  Adipogenic    = c("Pparg","Cebpa","Lpl","Fabp4","Adipoq"),
-  MALP          = c("Adipoq","Lpl","Fabp4","Pparg","Cxcl12","Lepr","Kitl","Apoe"),
+  # Endothelial subtypes (coarse)
+  Endo_arterial   = c("Gja5","Efnb2","Sox17","Bmx"),
+  Endo_venous     = c("Nr2f2","Vwf","Kdr","Vcam1"),
+  Endo_sinusoidal = c("Stab2","Lyve1","Kdr","Flt4","Klf2"),
 
-  # --- Vascular / mural
-  Pericyte      = c("Rgs5","Pdgfrb","Cspg4","Mcam","Des","Acta2"),
-  SmoothMuscle  = c("Acta2","Tagln","Myh11","Cnn1"),
-  Endothelial   = c("Pecam1","Kdr","Vwf","Emcn","Kdr","Robo4"),
+  # Mural subtypes
+  Pericyte        = c("Rgs5","Pdgfrb","Cspg4","Mcam","Des"),
+  SmoothMuscle    = c("Acta2","Tagln","Myh11","Cnn1"),
 
-  # --- Osteoclast / resorbing macrophage lineage
-  Osteoclast    = c("Acp5","Ctsk","Mmp9","Atp6v0d2","Ocstamp","Tcirg1","Calcr","Spi1"),
+  # Hematopoietic / immune subtypes
+  Myeloid_general = c("Lyz2","Tyrobp","Fcgr3","Lgals3","Aif1"),
+  Macrophage      = c("Adgre1","Csf1r","Mertk","Marco","Lgals3"),
+  Neutrophil      = c("S100a8","S100a9","Ly6g","Mpo","Elane"),
+  Dendritic       = c("Itgax","Flt3","Clec10a","Xcr1","Irf8"),
+  B_cell          = c("Ms4a1","Cd79a","Cd79b","Cd74","H2-Ab1"),
+  Plasma_cell     = c("Jchain","Mzb1","Xbp1","Sdc1"),
+  T_NK            = c("Cd3d","Cd3e","Trac","Ltb","Nkg7","Gzmb"),
 
-  # --- Myeloid / innate immune
-  Myeloid       = c("Lyz2","Tyrobp","Fcgr3","Lgals3","S100a8","S100a9"),
-  Macrophage    = c("Adgre1","Csf1r","Lgals3","Mertk","Marco"),
-  Neutrophil    = c("S100a8","S100a9","Ly6g","Mpo","Elane"),
-  Dendritic     = c("Itgax","Flt3","Clec10a","Xcr1","Irf8"),
-
-  # --- Lymphoid
-  Bcell         = c("Ms4a1","Cd79a","Cd79b","Cd74","H2-Ab1"),
-  Plasma        = c("Jchain","Mzb1","Xbp1","Sdc1"),
-  Tcell_NK      = c("Cd3d","Cd3e","Trac","Ltb","Nkg7","Gzmb"),
-
-  # --- HSPC / cycling progenitors
-  HSPC          = c("Kit","Lmo2","Gata2","Procr","Ly6a"),
-  Cycling       = c("Mki67","Top2a","Tubb5","Pclaf","Cenpf"),
-
-  # --- Erythroid / megakaryocyte
-  Erythroid     = c("Hbb-bs","Hbb-bt","Hba-a1","Hba-a2","Alas2"),
-  Megakaryocyte = c("Ppbp","Pf4","Nrgp","Itga2b")
+  # Osteoclast (myeloid-derived; if present)
+  Osteoclast      = c("Acp5","Ctsk","Mmp9","Atp6v0d2","Ocstamp","Tcirg1","Calcr","Nfatc1")
 )
 
-# Filter to genes present
-genes_present <- rownames(obj[["RNA"]])
-gene_sets <- lapply(gene_sets_raw, function(gs) unique(gs[gs %in% genes_present]))
-gene_sets <- gene_sets[sapply(gene_sets, length) >= 2]  # keep only usable sets
+subtype_sets <- filter_sets(subtype_sets_raw, genes_present, min_genes = 2)
 
-if (length(gene_sets) == 0) stop("All gene sets empty after filtering to present genes. Check feature naming.")
+cat("\n[Annotation] Subtype sets retained:\n")
+print(sapply(subtype_sets, length))
 
-cat("\nGene sets retained for scoring (counts):\n")
-print(sapply(gene_sets, length))
+tmp2 <- add_scores_per_set(obj, subtype_sets, assay = "RNA")
+obj <- tmp2$obj
+sub_score_cols <- tmp2$score_cols
 
-# AddModuleScore per gene set (robust: ensures all score columns exist)
-score_cols <- character(0)
-for (nm in names(gene_sets)) {
-  prefix <- paste0(nm, "_Score")
-  obj <- AddModuleScore(obj, features = list(gene_sets[[nm]]), name = prefix, assay = "RNA", search = FALSE)
-  colnm <- paste0(prefix, "1")
-  if (colnm %in% colnames(obj@meta.data)) score_cols <- c(score_cols, colnm)
-}
+sub_cluster_scores <- cluster_mean_scores(obj, sub_score_cols)
 
-cat("\nScore columns created:\n")
-print(score_cols)
-if (length(score_cols) < 2) warning("Only ", length(score_cols), " score column(s) created. Annotation will be limited.")
+# winner among subtypes
+sub_cluster_scores$sub_label <- winner_label(sub_cluster_scores, sub_score_cols)
 
-# Cluster-average scores
-scores_df <- FetchData(obj, vars = c("seurat_clusters", score_cols))
-cluster_scores <- scores_df %>%
-  dplyr::group_by(seurat_clusters) %>%
-  dplyr::summarise(dplyr::across(dplyr::all_of(score_cols), mean), .groups = "drop")
-
-score_mat <- as.matrix(cluster_scores[, score_cols, drop = FALSE])
-
-# Winner = max scoring program per cluster
-winner_col <- apply(score_mat, 1, function(x) colnames(score_mat)[which.max(x)])
-winner_set <- gsub("_Score1$", "", winner_col)
-
-# Map to cleaner names
-pretty_map <- c(
-  MSC_SSPC="MSC/SSPC",
+# pretty mapping
+sub_pretty <- c(
+  SSPC_MSC="SSPC/MSC",
   Osteoprogenitor="Osteoprogenitor",
   Osteoblast="Osteoblast",
   Osteocyte="Osteocyte",
   Adipogenic="Adipogenic",
   MALP="MALP",
-  Pericyte="Pericyte/Mural",
+  Endo_arterial="Endothelial (arterial)",
+  Endo_venous="Endothelial (venous)",
+  Endo_sinusoidal="Endothelial (sinusoidal)",
+  Pericyte="Pericyte",
   SmoothMuscle="Smooth muscle",
-  Endothelial="Endothelial",
-  Osteoclast="Osteoclast",
-  Myeloid="Myeloid",
+  Myeloid_general="Myeloid",
   Macrophage="Macrophage",
   Neutrophil="Neutrophil",
   Dendritic="Dendritic",
-  Bcell="B cell",
-  Plasma="Plasma cell",
-  Tcell_NK="T/NK cell",
-  HSPC="HSPC",
-  Cycling="Cycling",
-  Erythroid="Erythroid",
-  Megakaryocyte="Megakaryocyte"
+  B_cell="B cell",
+  Plasma_cell="Plasma cell",
+  T_NK="T/NK cell",
+  Osteoclast="Osteoclast"
 )
+sub_cluster_scores$subtype <- unname(sub_pretty[sub_cluster_scores$sub_label])
+sub_cluster_scores$subtype[is.na(sub_cluster_scores$subtype)] <- sub_cluster_scores$sub_label[is.na(sub_cluster_scores$subtype)]
 
-cluster_scores$auto_label <- winner_set
-cluster_scores$celltype <- unname(pretty_map[cluster_scores$auto_label])
+# Merge broad + subtype for a final "celltype" that respects compartment
+# Rule: if broad_class is Erythroid/Megakaryocyte/Cycling, keep that;
+# else use subtype (more informative) but you can still see broad_class separately.
+combo <- broad_cluster_scores %>%
+  dplyr::select(seurat_clusters, broad_class) %>%
+  dplyr::left_join(sub_cluster_scores %>% dplyr::select(seurat_clusters, subtype), by = "seurat_clusters")
 
-# If any NA labels occur (e.g., a set name not in pretty_map), keep raw label
-cluster_scores$celltype[is.na(cluster_scores$celltype)] <- cluster_scores$auto_label[is.na(cluster_scores$celltype)]
+combo$celltype <- combo$subtype
+combo$celltype[combo$broad_class %in% c("Erythroid","Megakaryocyte","Cycling")] <- combo$broad_class[combo$broad_class %in% c("Erythroid","Megakaryocyte","Cycling")]
+combo$celltype[is.na(combo$celltype)] <- combo$broad_class[is.na(combo$celltype)]
 
-# Apply cluster labels to cells
-label_map <- setNames(cluster_scores$celltype, cluster_scores$seurat_clusters)
-obj$celltype <- unname(label_map[as.character(obj$seurat_clusters)])
+# apply to cells
+celltype_map <- setNames(combo$celltype, combo$seurat_clusters)
+obj$celltype <- unname(celltype_map[as.character(obj$seurat_clusters)])
 
-# Save annotation table
-data.table::fwrite(cluster_scores, file.path(out_dir, "tables", "cluster_auto_annotation_by_module_score.csv"))
+# Save combined annotation tables
+data.table::fwrite(sub_cluster_scores, file.path(out_dir, "tables", "cluster_subtype_scores.csv"))
+data.table::fwrite(combo, file.path(out_dir, "tables", "cluster_final_annotation_broad_plus_subtype.csv"))
 
-# Annotated UMAP
+# Plot final celltype UMAP
 p_umap_celltype <- DimPlot(obj, reduction = "umap", group.by = "celltype", label = TRUE, repel = TRUE) + NoLegend()
-ggsave(file.path(out_dir, "figs", "UMAP_celltype_auto.png"), p_umap_celltype, width = 9, height = 7, dpi = 300)
+ggsave(file.path(out_dir, "figs", "UMAP_celltype_final.png"), p_umap_celltype, width = 10, height = 8, dpi = 300)
 
-# Validate with DotPlot of canonical markers
-canon_plot_genes <- unique(unlist(gene_sets))
-p_dot_canon <- DotPlot(obj, features = canon_plot_genes, group.by = "seurat_clusters") + RotatedAxis()
-ggsave(file.path(out_dir, "figs", "DotPlot_canonical_markers_by_cluster.png"), p_dot_canon, width = 16, height = 7, dpi = 300)
+# Diagnostic DotPlot: a curated marker panel (easier than plotting every gene-set gene)
+marker_panel <- unique(c(
+  # mesenchymal
+  "Lepr","Cxcl12","Kitl","Pdgfra","Ly6a",
+  # osteolineage
+  "Sp7","Runx2","Alpl","Col1a1","Bglap","Ibsp","Spp1",
+  # osteocyte
+  "Dmp1","Phex","Sost",
+  # adipogenic/MALP
+  "Adipoq","Lpl","Fabp4","Pparg",
+  # endo/mural
+  "Pecam1","Kdr","Vwf","Emcn","Rgs5","Pdgfrb","Cspg4","Acta2","Tagln","Myh11",
+  # hematopoietic
+  "Ptprc","Lyz2","Tyrobp","Aif1",
+  # lymphoid
+  "Ms4a1","Cd79a","Cd3d","Trac","Nkg7",
+  # osteoclast
+  "Acp5","Ctsk","Nfatc1",
+  # erythroid/mega
+  "Hbb-bs","Alas2","Pf4","Ppbp",
+  # cycling
+  "Mki67","Top2a"
+))
+marker_panel <- marker_panel[marker_panel %in% genes_present]
+
+p_dot_diag <- DotPlot(obj, features = marker_panel, group.by = "seurat_clusters") + RotatedAxis()
+ggsave(file.path(out_dir, "figs", "DotPlot_diagnostic_marker_panel_by_cluster.png"),
+       p_dot_diag, width = 16, height = 7, dpi = 300)
 
 # ============================================================
 # 8) Klb plots + summaries (RNA)
@@ -392,7 +461,7 @@ p_dot_cl <- DotPlot(obj, features = gene, group.by = "seurat_clusters") + Rotate
 ggsave(file.path(out_dir, "figs", paste0("DotPlot_", gene, "_by_clusters.png")),
        p_dot_cl, width = 10, height = 4, dpi = 300)
 
-# Violin/Dot by celltype
+# Violin/Dot by final celltype
 p_vln_ct <- VlnPlot(obj, features = gene, group.by = "celltype", pt.size = 0.1)
 ggsave(file.path(out_dir, "figs", paste0("Violin_", gene, "_by_celltype.png")),
        p_vln_ct, width = 12, height = 5, dpi = 300)
@@ -428,7 +497,7 @@ tab_celltype_age <- df_ct %>%
   ) %>% dplyr::arrange(dplyr::desc(pct_expressing), dplyr::desc(mean_expr))
 data.table::fwrite(tab_celltype_age, file.path(out_dir, "tables", paste0(gene, "_summary_by_celltype_and_age.csv")))
 
-# Extra: sparsity-friendly % expressing (Klb is extremely sparse in your run)
+# Sparsity-friendly % expressing by celltype
 df_bin <- FetchData(obj, vars = c(gene, "celltype"))
 colnames(df_bin)[1] <- "expr"
 df_bin$expressing <- df_bin$expr > 0
@@ -442,7 +511,8 @@ data.table::fwrite(pct_by_celltype, file.path(out_dir, "tables", paste0(gene, "_
 p_bar_ct <- ggplot2::ggplot(pct_by_celltype, ggplot2::aes(x = reorder(celltype, pct_expressing), y = pct_expressing)) +
   ggplot2::geom_col() +
   ggplot2::coord_flip() +
-  ggplot2::labs(x = "Cell type", y = paste0("% cells with ", gene, " > 0"), title = paste0(gene, " % expressing by cell type")) +
+  ggplot2::labs(x = "Cell type", y = paste0("% cells with ", gene, " > 0"),
+                title = paste0(gene, " % expressing by cell type")) +
   ggplot2::theme_bw()
 ggsave(file.path(out_dir, "figs", paste0(gene, "_PctExpressing_by_celltype_bar.png")),
        p_bar_ct, width = 8, height = 6, dpi = 300)
