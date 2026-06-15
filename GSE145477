@@ -26,7 +26,39 @@ for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 invisible(lapply(pkgs, library, character.only = TRUE))
 
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-if (!requireNamespace("glmGamPoi", quietly = TRUE)) BiocManager::install("glmGamPoi", ask = FALSE, update = FALSE)
+
+# --- Robust glmGamPoi install with fallbacks ---
+# Handles the "unable to access index for repository" error by:
+#   (1) increasing timeout and pinning to the matching Bioconductor version
+#   (2) forcing an explicit Bioc mirror + CRAN repo and retrying
+# If all fail, we set HAVE_GLMGAMPOI <- FALSE and SCTransform falls back below.
+install_glmGamPoi <- function() {
+  if (requireNamespace("glmGamPoi", quietly = TRUE)) return(TRUE)
+  options(timeout = 600)
+
+  # Try 1: standard install pinned to the matching Bioc version
+  try(
+    BiocManager::install("glmGamPoi", ask = FALSE, update = FALSE,
+                         version = BiocManager::version()),
+    silent = TRUE
+  )
+  if (requireNamespace("glmGamPoi", quietly = TRUE)) return(TRUE)
+
+  # Try 2: force explicit Bioc mirror + CRAN repo, then retry
+  options(BioC_mirror = "https://bioconductor.org",
+          repos = c(CRAN = "https://cloud.r-project.org"))
+  try(
+    BiocManager::install("glmGamPoi", ask = FALSE, update = FALSE),
+    silent = TRUE
+  )
+  requireNamespace("glmGamPoi", quietly = TRUE)
+}
+
+HAVE_GLMGAMPOI <- install_glmGamPoi()
+if (!HAVE_GLMGAMPOI) {
+  message("glmGamPoi unavailable (repo index error). ",
+          "Falling back to default SCTransform method ('poisson') — slower but equivalent results.")
+}
 
 options(future.globals.maxSize = 10 * 1024^3)  # 10 GB
 future::plan("sequential")
@@ -129,11 +161,13 @@ preprocess_sample <- function(counts, sample_id, age,
   thr <- compute_qc_thresholds(obj)
   obj <- apply_qc(obj, thr)
 
+  # Use glmGamPoi if available, otherwise fall back to the default 'poisson' method.
+  sct_method <- if (HAVE_GLMGAMPOI) "glmGamPoi" else "poisson"
   obj <- SCTransform(
     obj,
     assay = "RNA",
     vars.to.regress = vars_to_regress,
-    method = "glmGamPoi",
+    method = sct_method,
     verbose = FALSE
   )
 
@@ -272,7 +306,7 @@ broad_sets_raw <- list(
   Mural          = c("Rgs5","Pdgfrb","Cspg4","Mcam","Des","Acta2","Tagln","Myh11"),
   # Mesenchymal/stromal (Lepr/Cxcl12 axis + Pdgfra/Ly6a)
   Mesenchymal    = c("Lepr","Cxcl12","Kitl","Pdgfra","Ly6a","Col1a1","Col1a2"),
-  # Cycling (to prevent cycling clusters from being mislabeled as “something else”)
+  # Cycling (to prevent cycling clusters from being mislabeled as "something else")
   Cycling        = c("Mki67","Top2a","Cenpf","Pclaf","Tubb5")
 )
 
